@@ -48,10 +48,10 @@ To stream agent output in real-time (e.g., for fluid UI or console applications)
 ```python
 import asyncio
 import sys
-from google.antigravity import Agent, AgentConfig
+from google.antigravity import Agent, LocalAgentConfig
 
 async def main():
-    config = AgentConfig()
+    config = LocalAgentConfig()
     async with Agent(config) as agent:
         # Returns instantly — does not block
         response = await agent.chat("Write a short poem about space.")
@@ -112,7 +112,6 @@ from google.antigravity.types import GeminiConfig
 async def main():
     tool_runner = ToolRunner()
     strategy = LocalConnectionStrategy(
-        binary_path="/path/to/localharness",
         tool_runner=tool_runner,
         gemini_config=GeminiConfig(api_key="GEMINI_API_KEY"),
     )
@@ -193,9 +192,10 @@ their tools to the agent:
 
 ```python
 from google.antigravity import Agent, LocalAgentConfig
+from google.antigravity.types import McpStdioServer
 
 config = LocalAgentConfig(
-    mcp_servers=[{"type": "stdio", "command": "npx", "args": ["my-mcp-server"]}],
+    mcp_servers=[McpStdioServer(command="npx", args=["my-mcp-server"])],
 )
 async with Agent(config) as agent:
     response = await agent.chat("Use the MCP tools to help me.")
