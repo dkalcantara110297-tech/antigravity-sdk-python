@@ -81,8 +81,6 @@ __all__ = [
     "AntigravityCancelledError",
     "AntigravityValidationError",
     "AntigravityExecutionError",
-    "FileChangeKind",
-    "FileChange",
     "StreamChunk",
     "Thought",
     "Text",
@@ -784,28 +782,6 @@ class TriggerDelivery(str, enum.Enum):
   WAIT_IDLE = "wait_idle"  # Wait until agent is idle before sending.
   # TODO: INTERRUPT — cancel current turn, then send. Deferred due to
   # safety implications for in-flight tool calls (requires Connection.cancel()).
-
-
-class FileChangeKind(str, enum.Enum):
-  """Kind of filesystem change detected by a file-watching trigger."""
-
-  ADDED = "added"
-  MODIFIED = "modified"
-  DELETED = "deleted"
-
-
-class FileChange(pydantic.BaseModel):
-  """A single filesystem change detected by a file-watching trigger.
-
-  Attributes:
-    kind: The type of change (added, modified, deleted).
-    path: Absolute path to the changed file.
-  """
-
-  model_config = pydantic.ConfigDict(frozen=True)
-
-  kind: FileChangeKind
-  path: str
 
 
 # =============================================================================
