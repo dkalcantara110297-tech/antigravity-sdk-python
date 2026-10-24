@@ -16,12 +16,15 @@
 
 import contextlib
 import os
+import pathlib
+import tempfile
 from typing import Any, cast
 import unittest
 from unittest import mock
 
 from google.antigravity import agent
 from google.antigravity import types
+from google.antigravity import workflows
 from google.antigravity.connections import local as local_connection
 from google.antigravity.connections.local import local_connection as lc_module
 from google.antigravity.conversation import conversation
@@ -108,6 +111,146 @@ class AgentTest(unittest.IsolatedAsyncioTestCase):
       response = await ag.chat(multimodal_prompt)
       self.assertEqual(await response.text(), "Analyzed image content")
       mock_conversation.chat.assert_called_once_with(multimodal_prompt)
+
+  @mock.patch(
+      "google.antigravity.connections."
+      "local.local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  async def test_agent_chat_empty_input_raises_value_error(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    mock_strategy_instance = mock_strategy_class.return_value
+    mock_strategy_instance.stop = mock.AsyncMock()
+
+    mock_conversation = mock.MagicMock(spec=conversation.Conversation)
+    mock_cm = mock.AsyncMock()
+    mock_cm.__aenter__.return_value = mock_conversation
+    mock_conv_create.return_value = mock_cm
+
+    config = local_connection.LocalAgentConfig(system_instructions="test")
+    async with agent.Agent(config) as ag:
+      with self.assertRaisesRegex(ValueError, "non-empty message string"):
+        await ag.chat(None)
+      with self.assertRaisesRegex(ValueError, "non-empty message string"):
+        await ag.chat("")
+      with self.assertRaisesRegex(ValueError, "non-empty message string"):
+        await ag.chat("   ")
+      with self.assertRaisesRegex(ValueError, "non-empty message content"):
+        await ag.chat([])
+      with self.assertRaisesRegex(ValueError, "non-empty message content"):
+        await ag.chat(["", "   "])
+      with self.assertRaisesRegex(ValueError, "non-empty message content"):
+        await ag.chat(())
+      with self.assertRaisesRegex(ValueError, "non-empty message content"):
+        await ag.chat(("", "   "))
+      mock_conversation.chat.assert_not_called()
+
+  @mock.patch(
+      "google.antigravity.connections."
+      "local.local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  async def test_agent_collects_subagent_custom_tools_into_tool_runner(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    del mock_conv_create
+    mock_strategy_instance = mock.MagicMock()
+    mock_strategy_instance.stop = mock.AsyncMock()
+    mock_strategy_class.return_value = mock_strategy_instance
+
+    def root_tool():
+      """Root tool."""
+
+    def sub_tool():
+      """Subagent tool."""
+
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test",
+        tools=[root_tool],
+        subagents=[
+            types.SubagentConfig(
+                name="helper",
+                description="helper",
+                tools=[sub_tool],
+            )
+        ],
+    )
+    async with agent.Agent(config) as ag:
+      self.assertIsNotNone(ag._tool_runner)
+      self.assertIn("root_tool", ag._tool_runner.tools)
+      self.assertIn("sub_tool", ag._tool_runner.tools)
+
+  def test_agent_config_get_all_custom_tools_guards_none_and_deduplicates(self):
+    # Test None guards return empty list
+    empty_config = local_connection.LocalAgentConfig(tools=None, subagents=None)
+    self.assertEqual(empty_config._get_all_custom_tools(), [])
+
+    # Test subagents with None tools returns empty list
+    sub_none_tools_config = local_connection.LocalAgentConfig(
+        tools=None,
+        subagents=[
+            types.SubagentConfig(name="sub", description="sub", tools=None)
+        ],
+    )
+    self.assertEqual(sub_none_tools_config._get_all_custom_tools(), [])
+
+    # Test filtering out string tools and preserving callables
+    def shared_tool():
+      """Shared tool."""
+
+    def sub_only_tool():
+      """Sub only tool."""
+
+    config = local_connection.LocalAgentConfig(
+        tools=[shared_tool, "view_file"],
+        subagents=[
+            types.SubagentConfig(
+                name="sub1",
+                description="sub1",
+                tools=[shared_tool, sub_only_tool, "grep_search"],
+            ),
+            types.SubagentConfig(
+                name="sub2",
+                description="sub2",
+                tools=[sub_only_tool],
+            ),
+        ],
+    )
+    all_tools = config._get_all_custom_tools()
+    self.assertEqual(len(all_tools), 2)
+    self.assertIn(shared_tool, all_tools)
+    self.assertIn(sub_only_tool, all_tools)
+
+  def test_agent_config_get_all_custom_tools_raises_on_name_collision(self):
+    def tool_fn():
+      """Root tool."""
+
+    # Define a distinct function object with the exact same name
+    def make_conflicting_tool():
+      def tool_fn():
+        """Conflicting sub tool."""
+
+      return tool_fn
+
+    conflicting_tool = make_conflicting_tool()
+
+    config = local_connection.LocalAgentConfig(
+        tools=[tool_fn],
+        subagents=[
+            types.SubagentConfig(
+                name="sub1",
+                description="sub1",
+                tools=[conflicting_tool],
+            ),
+        ],
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        "Duplicate custom tool name 'tool_fn' detected across agent and"
+        " subagent 'sub1' configurations.",
+    ):
+      config._get_all_custom_tools()
 
   @mock.patch(
       "google.antigravity.connections."
@@ -238,6 +381,52 @@ class AgentTest(unittest.IsolatedAsyncioTestCase):
         capabilities=types.CapabilitiesConfig(
             enabled_tools=types.BuiltinTools.read_only(),
         ),
+    )
+    async with agent.Agent(config):
+      pass  # Should not raise.
+
+  @mock.patch(
+      "google.antigravity.connections."
+      "local.local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  async def test_policy_guard_deprecated_read_only_explicit_passes(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    """No guard when deprecated read-only tools are explicitly enabled."""
+    del mock_conv_create
+    mock_strategy_class.return_value = mock.MagicMock(stop=mock.AsyncMock())
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test",
+        capabilities=types.CapabilitiesConfig(
+            enabled_tools=types.BuiltinTools.deprecated(),
+        ),
+    )
+    async with agent.Agent(config):
+      pass  # Should not raise.
+
+  @mock.patch(
+      "google.antigravity.connections."
+      "local.local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  async def test_policy_guard_disabling_all_default_write_tools_passes(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    """Disabling all default write tools leaves only read-only tools active."""
+    del mock_conv_create
+    mock_strategy_class.return_value = mock.MagicMock(stop=mock.AsyncMock())
+    default_write_tools = list(
+        set(types.BuiltinTools.default())
+        - set(types.BuiltinTools.read_only())
+    )
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test",
+        capabilities=types.CapabilitiesConfig(
+            disabled_tools=default_write_tools,
+        ),
+        policies=[],
+        workspaces=[],
     )
     async with agent.Agent(config):
       pass  # Should not raise.
@@ -444,30 +633,6 @@ class AgentTest(unittest.IsolatedAsyncioTestCase):
       "local.local_connection.LocalConnectionStrategy"
   )
   @mock.patch.object(conversation.Conversation, "create")
-  async def test_agent_with_policies(
-      self, mock_conv_create, mock_strategy_class
-  ):
-    del mock_conv_create  # Unused.
-
-    mock_strategy_instance = mock.MagicMock()
-    mock_strategy_instance.stop = mock.AsyncMock()
-    mock_strategy_class.return_value = mock_strategy_instance
-
-    my_policy = policy.allow("some_tool")
-
-    config = local_connection.LocalAgentConfig(
-        system_instructions="test",
-        capabilities=types.CapabilitiesConfig(),
-        policies=[my_policy],
-    )
-    async with agent.Agent(config) as ag:
-      self.assertEqual(len(ag._hook_runner.pre_tool_call_decide_hooks), 1)
-
-  @mock.patch(
-      "google.antigravity.connections."
-      "local.local_connection.LocalConnectionStrategy"
-  )
-  @mock.patch.object(conversation.Conversation, "create")
   async def test_agent_write_mode_with_policies(
       self, mock_conv_create, mock_strategy_class
   ):
@@ -641,13 +806,15 @@ class AgentTest(unittest.IsolatedAsyncioTestCase):
 
     config = local_connection.LocalAgentConfig(
         system_instructions="test",
-        conversation_id="resume-id",
+        conversation_id="12345678901234567890123456789012",
         save_dir="/state",
         workspaces=["/path/1", "/path/2"],
     )
     async with agent.Agent(config) as _:
       _, kwargs = mock_strategy_class.call_args
-      self.assertEqual(kwargs.get("conversation_id"), "resume-id")
+      self.assertEqual(
+          kwargs.get("conversation_id"), "12345678901234567890123456789012"
+      )
       self.assertEqual(kwargs.get("save_dir"), "/state")
       self.assertEqual(kwargs.get("workspaces"), ["/path/1", "/path/2"])
 
@@ -673,6 +840,34 @@ class AgentTest(unittest.IsolatedAsyncioTestCase):
       _, kwargs = mock_strategy_class.call_args
       sp = kwargs.get("skills_paths")
       self.assertEqual(sp, skills_paths)
+
+  @mock.patch(
+      "google.antigravity.connections."
+      "local.local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  async def test_agent_with_inline_skills(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    del mock_conv_create  # Unused.
+
+    mock_strategy_instance = mock.MagicMock()
+    mock_strategy_instance.stop = mock.AsyncMock()
+    mock_strategy_class.return_value = mock_strategy_instance
+
+    inline_skills = [
+        types.InlineSkill(
+            name="my-skill",
+            description="A test skill.",
+            content="# Instructions",
+        )
+    ]
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test", inline_skills=inline_skills
+    )
+    async with agent.Agent(config) as _:
+      _, kwargs = mock_strategy_class.call_args
+      self.assertEqual(kwargs.get("inline_skills"), inline_skills)
 
   @mock.patch(
       "google.antigravity.connections."
@@ -731,7 +926,7 @@ class AgentTest(unittest.IsolatedAsyncioTestCase):
     mock_exit_stack.__aexit__.assert_called_once_with(ValueError, exc, None)
 
 
-class AgentConfigTest(unittest.TestCase):
+class AgentConfigTest(unittest.IsolatedAsyncioTestCase):
   """Tests for AgentConfig sugar, conflict guards, and defensive copy."""
 
   def test_sugar_model_flows_to_models(self):
@@ -762,14 +957,11 @@ class AgentConfigTest(unittest.TestCase):
     config = local_connection.LocalAgentConfig(system_instructions="test")
     self.assertIsNone(config.capabilities.enabled_tools)
     self.assertIsNone(config.capabilities.disabled_tools)
-    # Default includes 3 workspace_only policies (CWD) + 2
-    # confirm_run_command policies.
-    self.assertEqual(len(config.policies), 5)
-    for i in range(3):
-      self.assertEqual(config.policies[i].decision, policy.Decision.DENY)
-      self.assertEqual(config.policies[i].name, "workspace_only")
-    self.assertEqual(config.policies[3].tool, "run_command")
-    self.assertEqual(config.policies[4].tool, "*")
+    # Default includes only the 2 policies from policy.confirm_run_command();
+    # workspace containment is enforced natively by localharness.
+    self.assertEqual(len(config.policies), 2)
+    self.assertEqual(config.policies[0].tool, "run_command")
+    self.assertEqual(config.policies[1].tool, "*")
     self.assertIsNotNone(config.models)
     text_model = [m for m in config.models if types.ModelType.TEXT in m.types][
         0
@@ -830,6 +1022,377 @@ class AgentConfigTest(unittest.TestCase):
     mock_conv.conversation_id = "test-conv-123"
     a._conversation = mock_conv
     self.assertEqual(a.conversation_id, "test-conv-123")
+
+  @mock.patch(
+      "google.antigravity.connections."
+      "local.local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  async def test_auto_policy_allows_write_tools(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    """When policy.auto() is present, write tools should not be restricted."""
+    del mock_conv_create  # Unused.
+    mock_strategy_instance = mock.MagicMock()
+    mock_strategy_instance.stop = mock.AsyncMock()
+    mock_strategy_class.return_value = mock_strategy_instance
+
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test",
+        capabilities=types.CapabilitiesConfig(),
+        policies=[policy.auto()],
+    )
+    async with agent.Agent(config):
+      _, kwargs = mock_strategy_class.call_args
+      capabilities_config = kwargs.get("capabilities_config")
+      self.assertIsNotNone(capabilities_config)
+      active_tools = agent.connection_module.resolve_active_tools(
+          capabilities_config
+      )
+      self.assertIn(types.BuiltinTools.RUN_COMMAND, active_tools)
+      policies = kwargs.get("policies")
+      self.assertTrue(any(isinstance(p, policy.AutoPolicy) for p in policies))
+
+  @mock.patch.object(lc_module, "LocalConnectionStrategy", autospec=True)
+  @mock.patch.object(conversation.Conversation, "create", autospec=True)
+  async def test_run_workflow_with_decorated_function(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    mock_strategy_instance = mock_strategy_class.return_value
+    mock_strategy_instance.stop = mock.AsyncMock()
+
+    mock_conversation = mock.MagicMock(spec=conversation.Conversation)
+    mock_conversation._connection = mock.MagicMock()
+    mock_conversation.history = []
+    mock_cm = mock.AsyncMock()
+    mock_cm.__aenter__.return_value = mock_conversation
+    mock_conv_create.return_value = mock_cm
+
+    @workflows.define
+    def sample_workflow():
+      """Sample workflow docstring."""
+      workflows.phase("Explore")
+      res = workflows.agent("Check files")
+      workflows.log("Result:", res)
+
+    captured_script_paths: list[str] = []
+
+    async def fake_chat(prompt: str):
+      # Extract script path from prompt and verify it exists during execution.
+      for token in prompt.split("`"):
+        if token.endswith(".py"):
+          captured_script_paths.append(token)
+          self.assertTrue(pathlib.Path(token).is_file())
+          break
+      mock_conversation.history.append(
+          types.Step(
+              id="traj-1:1",
+              step_index=1,
+              type=types.StepType.TOOL_CALL,
+              status=types.StepStatus.DONE,
+              tool_calls=[
+                  types.ToolCall(
+                      name="run_workflow",
+                      args={
+                          "script_path": captured_script_paths[0],
+                          "description": "Sample workflow docstring.",
+                      },
+                  )
+              ],
+              workflow_progress=types.WorkflowProgress(
+                  script_path=captured_script_paths[0],
+                  description="Sample workflow docstring.",
+                  output="Result: ok",
+              ),
+          )
+      )
+      resp = mock.MagicMock(spec=types.ChatResponse)
+      resp.text = mock.AsyncMock(return_value="Workflow completed.")
+      return resp
+
+    mock_conversation.chat = mock.AsyncMock(side_effect=fake_chat)
+
+    with tempfile.TemporaryDirectory() as ws_dir:
+      config = local_connection.LocalAgentConfig(
+          system_instructions="test",
+          workspaces=[ws_dir],
+      )
+      async with agent.Agent(config) as ag:
+        self.assertFalse(hasattr(ag, "run_workflow"))
+        result = await ag.beta.run_workflow(sample_workflow)
+        self.assertIsInstance(result, types.ChatResponse)
+        self.assertEqual(result.description, "Sample workflow docstring.")
+        self.assertEqual(result.output, "Result: ok")
+        self.assertEqual(result.response_text, "Workflow completed.")
+        self.assertEqual(len(captured_script_paths), 1)
+        # Temp script must be cleaned up after run_workflow completes.
+        self.assertFalse(pathlib.Path(captured_script_paths[0]).exists())
+
+  @mock.patch.object(lc_module, "LocalConnectionStrategy", autospec=True)
+  @mock.patch.object(conversation.Conversation, "create", autospec=True)
+  async def test_run_workflow_with_undecorated_function_and_chat_response_accessors(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    mock_strategy_instance = mock_strategy_class.return_value
+    mock_strategy_instance.stop = mock.AsyncMock()
+
+    mock_conversation = mock.MagicMock(spec=conversation.Conversation)
+    mock_conversation._connection = mock.MagicMock()
+    mock_conversation.history = []
+    mock_conversation.get_last_structured_output.return_value = {"status": "ok"}
+    mock_conversation.last_turn_usage = types.UsageMetadata(
+        prompt_token_count=12,
+        candidates_token_count=8,
+        total_token_count=20,
+    )
+    mock_conversation._last_turn_stop_reason = types.StopReason.UNSPECIFIED
+    mock_cm = mock.AsyncMock()
+    mock_cm.__aenter__.return_value = mock_conversation
+    mock_conv_create.return_value = mock_cm
+
+    async def raw_workflow():
+      """Undecorated workflow docstring."""
+      workflows.phase("Inspect")
+      workflows.log("inspected")
+
+    captured_prompts: list[str] = []
+
+    async def fake_chat(prompt: str):
+      captured_prompts.append(prompt)
+      mock_conversation.history.append(
+          types.Step(
+              id="traj-1:1",
+              step_index=1,
+              type=types.StepType.TOOL_CALL,
+              status=types.StepStatus.DONE,
+              tool_calls=[
+                  types.ToolCall(
+                      name="run_workflow",
+                      args={"description": "Undecorated workflow docstring."},
+                  )
+              ],
+              workflow_progress=types.WorkflowProgress(
+                  output="inspected",
+              ),
+          )
+      )
+
+      async def _stream():
+        yield types.Thought(step_index=1, text="Planning workflow.")
+        yield types.Text(step_index=2, text="Workflow completed.")
+
+      return types.ChatResponse(_stream(), conversation=mock_conversation)
+
+    mock_conversation.chat = mock.AsyncMock(side_effect=fake_chat)
+
+    config = local_connection.LocalAgentConfig(system_instructions="test")
+    async with agent.Agent(config) as ag:
+      result = await ag.beta.run_workflow(raw_workflow)
+      self.assertIsInstance(result, types.ChatResponse)
+      self.assertEqual(len(captured_prompts), 1)
+      self.assertIn("Undecorated workflow docstring.", captured_prompts[0])
+      self.assertEqual(result.description, "Undecorated workflow docstring.")
+      self.assertEqual(result.output, "inspected")
+      self.assertEqual(result.response_text, "Workflow completed.")
+      self.assertEqual(await result.text(), "Workflow completed.")
+      self.assertEqual(await result.structured_output(), {"status": "ok"})
+      self.assertEqual(
+          [t async for t in result.thoughts], ["Planning workflow."]
+      )
+      self.assertIsNotNone(result.usage_metadata)
+      self.assertEqual(result.usage_metadata.total_token_count, 20)
+      self.assertEqual(result.stop_reason, types.StopReason.UNSPECIFIED)
+
+  @mock.patch.object(lc_module, "LocalConnectionStrategy", autospec=True)
+  @mock.patch.object(conversation.Conversation, "create", autospec=True)
+  async def test_run_workflow_raises_when_disabled(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    mock_strategy_instance = mock_strategy_class.return_value
+    mock_strategy_instance.stop = mock.AsyncMock()
+
+    mock_conversation = mock.MagicMock(spec=conversation.Conversation)
+    mock_conversation._connection = mock.MagicMock()
+    mock_cm = mock.AsyncMock()
+    mock_cm.__aenter__.return_value = mock_conversation
+    mock_conv_create.return_value = mock_cm
+
+    @workflows.define
+    def noop_wf():
+      workflows.phase("Noop")
+
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test",
+        capabilities=types.CapabilitiesConfig(
+            disabled_tools=[types.BuiltinTools.RUN_WORKFLOW]
+        ),
+    )
+    async with agent.Agent(config) as ag:
+      with self.assertRaisesRegex(
+          ValueError, "BuiltinTools.RUN_WORKFLOW is not enabled"
+      ):
+        await ag.beta.run_workflow(noop_wf)
+
+  @mock.patch.object(lc_module, "LocalConnectionStrategy", autospec=True)
+  @mock.patch.object(conversation.Conversation, "create", autospec=True)
+  async def test_run_workflow_raises_on_step_error(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    mock_strategy_instance = mock_strategy_class.return_value
+    mock_strategy_instance.stop = mock.AsyncMock()
+
+    mock_conversation = mock.MagicMock(spec=conversation.Conversation)
+    mock_conversation._connection = mock.MagicMock()
+    mock_conversation.history = []
+    mock_cm = mock.AsyncMock()
+    mock_cm.__aenter__.return_value = mock_conversation
+    mock_conv_create.return_value = mock_cm
+
+    @workflows.define
+    def failing_wf():
+      workflows.phase("Fail")
+
+    async def fake_chat(prompt: str):
+      del prompt
+      mock_conversation.history.append(
+          types.Step(
+              id="traj-1:1",
+              step_index=1,
+              type=types.StepType.TOOL_CALL,
+              status=types.StepStatus.ERROR,
+              error="workflow execution failed: RuntimeError: boom",
+              tool_calls=[types.ToolCall(name="run_workflow", args={})],
+          )
+      )
+      resp = mock.MagicMock(spec=types.ChatResponse)
+      resp.text = mock.AsyncMock(return_value="Failed.")
+      return resp
+
+    mock_conversation.chat = mock.AsyncMock(side_effect=fake_chat)
+
+    config = local_connection.LocalAgentConfig(system_instructions="test")
+    async with agent.Agent(config) as ag:
+      with self.assertRaisesRegex(
+          types.ToolExecutionError, "workflow execution failed"
+      ) as cm:
+        await ag.beta.run_workflow(failing_wf)
+      self.assertEqual(
+          cm.exception.tool_name, types.BuiltinTools.RUN_WORKFLOW.value
+      )
+
+  @mock.patch.object(lc_module, "LocalConnectionStrategy", autospec=True)
+  @mock.patch.object(conversation.Conversation, "create", autospec=True)
+  async def test_run_workflow_with_script_path_preserves_user_file(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    mock_strategy_instance = mock_strategy_class.return_value
+    mock_strategy_instance.stop = mock.AsyncMock()
+
+    mock_conversation = mock.MagicMock(spec=conversation.Conversation)
+    mock_conversation._connection = mock.MagicMock()
+    mock_conversation.history = []
+    mock_cm = mock.AsyncMock()
+    mock_cm.__aenter__.return_value = mock_conversation
+    mock_conv_create.return_value = mock_cm
+
+    with tempfile.TemporaryDirectory() as ws_dir:
+      script_file = pathlib.Path(ws_dir) / "my_workflow.py"
+      script_file.write_text("phase('Audit')\nlog('done')\n", encoding="utf-8")
+
+      async def fake_chat(prompt: str):
+        self.assertIn(str(script_file.resolve()), prompt)
+        mock_conversation.history.append(
+            types.Step(
+                id="traj-1:1",
+                step_index=1,
+                type=types.StepType.TOOL_CALL,
+                status=types.StepStatus.DONE,
+                tool_calls=[
+                    types.ToolCall(
+                        name="run_workflow",
+                        args={"script_path": str(script_file.resolve())},
+                    )
+                ],
+                workflow_progress=types.WorkflowProgress(
+                    script_path=str(script_file.resolve()),
+                    description="Run workflow my_workflow.py",
+                    output="done",
+                ),
+            )
+        )
+        resp = mock.MagicMock(spec=types.ChatResponse)
+        resp.text = mock.AsyncMock(return_value="Completed.")
+        return resp
+
+      mock_conversation.chat = mock.AsyncMock(side_effect=fake_chat)
+
+      config = local_connection.LocalAgentConfig(
+          system_instructions="test",
+          workspaces=[ws_dir],
+      )
+      async with agent.Agent(config) as ag:
+        # Pass relative script path resolved against workspace.
+        res = await ag.beta.run_workflow(script_path="my_workflow.py")
+        self.assertEqual(res.script_path, str(script_file.resolve()))
+        self.assertEqual(res.output, "done")
+        # User's script file must NOT be deleted after run_workflow completes.
+        self.assertTrue(script_file.is_file())
+
+        with self.assertRaises(FileNotFoundError):
+          await ag.beta.run_workflow(script_path="does_not_exist.py")
+
+        # Passing neither or both of `workflow` and `script_path` must fail.
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires exactly one of `workflow` or `script_path`",
+        ):
+          await ag.beta.run_workflow()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires exactly one of `workflow` or `script_path`",
+        ):
+          await ag.beta.run_workflow(
+              lambda: None, script_path=str(script_file.resolve())
+          )
+
+  @mock.patch.object(lc_module, "LocalConnectionStrategy", autospec=True)
+  @mock.patch.object(conversation.Conversation, "create", autospec=True)
+  async def test_run_workflow_raises_when_tool_not_invoked(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    mock_strategy_instance = mock_strategy_class.return_value
+    mock_strategy_instance.stop = mock.AsyncMock()
+
+    mock_conversation = mock.MagicMock(spec=conversation.Conversation)
+    mock_conversation._connection = mock.MagicMock()
+    mock_conversation.history = []
+    mock_cm = mock.AsyncMock()
+    mock_cm.__aenter__.return_value = mock_conversation
+    mock_conv_create.return_value = mock_cm
+
+    @workflows.define
+    def sample_wf():
+      workflows.phase("Check")
+
+    async def fake_chat(prompt: str):
+      del prompt
+      resp = mock.MagicMock(spec=types.ChatResponse)
+      resp.text = mock.AsyncMock(return_value="I did not call run_workflow.")
+      return resp
+
+    mock_conversation.chat = mock.AsyncMock(side_effect=fake_chat)
+
+    config = local_connection.LocalAgentConfig(system_instructions="test")
+    async with agent.Agent(config) as ag:
+      with self.assertRaisesRegex(
+          types.ToolExecutionError,
+          "The model did not invoke the run_workflow tool",
+      ) as cm:
+        await ag.beta.run_workflow(sample_wf)
+      self.assertEqual(
+          cm.exception.tool_name, types.BuiltinTools.RUN_WORKFLOW.value
+      )
 
 
 if __name__ == "__main__":

@@ -32,8 +32,8 @@ import pydantic
 # Constants
 # =============================================================================
 
-DEFAULT_MODEL = "gemini-3.5-flash"
-DEFAULT_IMAGE_GENERATION_MODEL = "gemini-3.1-flash-image-preview"
+DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_IMAGE_GENERATION_MODEL = "gemini-3.1-flash-lite-image"
 
 
 # =============================================================================
@@ -53,12 +53,31 @@ class ThinkingLevel(str, enum.Enum):
     LOW: Low thinking.
     MEDIUM: Medium thinking.
     HIGH: High thinking.
+    EXTRA_HIGH: Extra-high thinking.
   """
 
   MINIMAL = "minimal"
   LOW = "low"
   MEDIUM = "medium"
   HIGH = "high"
+  EXTRA_HIGH = "extra_high"
+
+
+class ServiceTier(str, enum.Enum):
+  """Service tier for Gemini model inference.
+
+  Controls the compute queue priority and rate limit fallback behavior. See:
+  https://ai.google.dev/gemini-api/docs/priority-inference
+
+  Attributes:
+    STANDARD: Standard processing tier.
+    PRIORITY: Prioritized inference tier.
+    FLEX: Flex processing tier.
+  """
+
+  STANDARD = "standard"
+  PRIORITY = "priority"
+  FLEX = "flex"
 
 
 class ModelType(str, enum.Enum):
@@ -84,6 +103,10 @@ class GeminiModelOptions(pydantic.BaseModel):
   """Gemini-specific model options."""
 
   thinking_level: ThinkingLevel | None = None
+  service_tier: ServiceTier | None = None
+  max_output_tokens: int | None = pydantic.Field(
+      default=None, gt=0, le=2**31 - 1
+  )
 
 
 class GeminiAPIEndpoint(ModelEndpoint):
@@ -109,13 +132,41 @@ class VertexEndpoint(ModelEndpoint):
 
   project: str | None = None
   location: str | None = None
+  api_key: str | None = None
   options: GeminiModelOptions | None = None
 
+  @pydantic.model_validator(mode="before")
+  @classmethod
+  def _populate_env_vars(cls, data: Any) -> Any:
+    # Skip populating ambient project/location from the environment when a
+    # custom base_url is specified. This matches the Google Gen AI SDK behavior
+    # to avoid contaminating external proxies/gateways with ambient shell
+    # project metadata (which alters URL paths to /projects/.../locations/...).
+    if isinstance(data, dict) and not data.get("base_url"):
+      if not data.get("api_key"):
+        if data.get("project") is None:
+          data["project"] = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        if data.get("location") is None:
+          data["location"] = os.environ.get("GOOGLE_CLOUD_LOCATION")
+    return data
+
   def validate_endpoint(self) -> None:
-    if not (self.project and self.location):
+    if self.base_url:
+      return  # External API, validation is done by the external API.
+
+    has_regional_auth = bool(self.project and self.location)
+    has_any_regional_arg = bool(self.project or self.location)
+    has_express_auth = bool(self.api_key)
+
+    if has_any_regional_arg and has_express_auth:
       raise ValueError(
-          "For Vertex AI, a GCP project and location, or an API key (Express"
-          " Mode), must be set."
+          "Cannot specify both api_key (Express Mode) and project/location"
+          " (Standard Mode) on VertexEndpoint."
+      )
+
+    if not (has_regional_auth or has_express_auth):
+      raise ValueError(
+          "For Vertex AI, either (project and location) or api_key must be set."
       )
 
 
@@ -127,18 +178,3 @@ class ModelTarget(pydantic.BaseModel):
       default_factory=lambda: [ModelType.TEXT]
   )
   endpoint: ModelEndpoint | None = None
-
-
-def _coerce_models_list(v: Any) -> list[ModelTarget] | None:
-  """Coerces shorthand model definitions into a list of ModelTargets."""
-  if v is None:
-    return None
-  if isinstance(v, list):
-    coerced = []
-    for item in v:
-      if isinstance(item, dict):
-        coerced.append(ModelTarget.model_validate(item))
-      else:
-        coerced.append(item)
-    return coerced
-  return v

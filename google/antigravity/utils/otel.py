@@ -92,9 +92,6 @@ class OTelSessionStartHook(hooks.OnSessionStartHook):
     assert isinstance(context, hooks.SessionContext)
     span = _get_tracer().start_span("antigravity.session")
     context.set_state("session_span", span)
-    ctx_manager = trace.use_span(span)
-    ctx_manager.__enter__()  # pytype: disable=attribute-error
-    context.set_state("session_ctx_mgr", ctx_manager)
 
 
 class OTelSessionEndHook(hooks.OnSessionEndHook):
@@ -106,9 +103,6 @@ class OTelSessionEndHook(hooks.OnSessionEndHook):
     span = context.get_state("session_span")
     if span and span.is_recording():
       span.end()
-    ctx_mgr = context.get_state("session_ctx_mgr")
-    if ctx_mgr:
-      ctx_mgr.__exit__(None, None, None)
 
 
 class OTelPreTurnHook(hooks.PreTurnHook):
@@ -132,10 +126,6 @@ class OTelPreTurnHook(hooks.PreTurnHook):
     span.set_attribute("gen_ai.operation.name", "invoke_agent")
     span.set_attribute("gen_ai.agent.name", self._agent_name)
     context.set_state("turn_span", span)
-
-    ctx_mgr = trace.use_span(span)
-    ctx_mgr.__enter__()  # pytype: disable=attribute-error
-    context.set_state("turn_ctx_mgr", ctx_mgr)
     return hooks.HookResult(allow=True)
 
 
@@ -170,9 +160,6 @@ class OTelPostTurnHook(hooks.PostTurnHook):
     span = context.get_state("turn_span")
     if span and span.is_recording():
       span.end()
-    ctx_mgr = context.get_state("turn_ctx_mgr")
-    if ctx_mgr:
-      ctx_mgr.__exit__(None, None, None)
 
 
 class OTelPreStepHook(hooks._PreStepHook):  # pylint: disable=protected-access
@@ -309,7 +296,7 @@ class OTelPreToolCallHook(hooks.PreToolCallDecideHook):
     assert isinstance(context, hooks.OperationContext)
 
     # Queue subagent name if invoking a subagent
-    if data.name == types.BuiltinTools.START_SUBAGENT.value:
+    if data.name == types.BuiltinTools.INVOKE_SUBAGENT.value:
       subagent_name = (
           data.args.get("TypeName") or data.args.get("Role") or "subagent"
       )
@@ -343,16 +330,24 @@ class OTelPreToolCallHook(hooks.PreToolCallDecideHook):
     # Store in local OperationContext for post-hooks
     context.set_state("active_tool_span", span)
 
-    # Make the span active in the current task
-    ctx_mgr = trace.use_span(span)
-    ctx_mgr.__enter__()  # pytype: disable=attribute-error
-    context.set_state("tool_ctx_mgr", ctx_mgr)
+    # Make the span active in the current task only for custom tools.
+    # Built-in tools do not execute user code and do not need to be active.
     try:
-      current_task = asyncio.current_task()
-      task_id = id(current_task) if current_task else None
-    except RuntimeError:
-      task_id = None
-    context.set_state("tool_ctx_task_id", task_id)
+      types.BuiltinTools(data.name)
+      is_builtin = True
+    except ValueError:
+      is_builtin = False
+
+    if not is_builtin:
+      ctx_mgr = trace.use_span(span)
+      ctx_mgr.__enter__()  # pytype: disable=attribute-error
+      context.set_state("tool_ctx_mgr", ctx_mgr)
+      try:
+        current_task = asyncio.current_task()
+        task_id = id(current_task) if current_task else None
+      except RuntimeError:
+        task_id = None
+      context.set_state("tool_ctx_task_id", task_id)
 
     # Documenting timing limitation:
     # Note: Because this decide hook runs before safety policy checks,
@@ -367,7 +362,7 @@ class OTelPostToolCallHook(hooks.PostToolCallHook):
       self, context: hooks.HookContext, data: types.ToolResult
   ) -> None:
     assert isinstance(context, hooks.OperationContext)
-    if data.name == types.BuiltinTools.START_SUBAGENT.value:
+    if data.name == types.BuiltinTools.INVOKE_SUBAGENT.value:
       subagent_trajectory_id = context.get_state("trajectory_id")
       if subagent_trajectory_id:
         subagent_span_key = _get_subagent_span_key(subagent_trajectory_id)
@@ -419,9 +414,9 @@ class OTelOnToolErrorHook(hooks.OnToolErrorHook):
     assert isinstance(context, hooks.OperationContext)
     span = context.get_state("active_tool_span")
     if span:
-      span.record_exception(data)
-      span.set_status(trace.StatusCode.ERROR, str(data))
       if span.is_recording():
+        span.record_exception(data)
+        span.set_status(trace.StatusCode.ERROR, str(data))
         span.end()
 
     # Clean up from parent TurnContext

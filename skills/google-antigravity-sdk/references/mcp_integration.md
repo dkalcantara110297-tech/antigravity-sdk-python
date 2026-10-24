@@ -1,5 +1,5 @@
-<!-- disableFinding(LINK_RELATIVE_G3DOC) -->
-<!-- disableFinding(LINE_OVER_80) -->
+
+
 
 # MCP Integration in Google Antigravity SDK
 
@@ -101,6 +101,20 @@ stdio_server = types.McpStdioServer(
     command="python3",
     args=["mcp_server.py"],
     disabled_tools=["pirate_divide"],  # All tools except pirate_divide will be exposed
+)
+```
+
+## Configuring Output Size Limits (`mcp_max_output_bytes`)
+
+By default, MCP tool outputs and resource reads larger than `4096` bytes are
+offloaded to a temporary file on disk instead of being inlined directly into the
+model's context. For MCP servers that return large structured payloads or
+when file-read tools (`view_file`) are disabled, you can increase this session
+limit on `CapabilitiesConfig`:
+
+```python
+capabilities = types.CapabilitiesConfig(
+    mcp_max_output_bytes=65536,  # Inline MCP outputs up to 64 KiB
 )
 ```
 

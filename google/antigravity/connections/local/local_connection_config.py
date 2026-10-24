@@ -43,33 +43,42 @@ BUILTIN_TOOL_PROTO_FIELDS: dict[types.BuiltinTools, str] = {
     types.BuiltinTools.RUN_COMMAND: "run_command",
     types.BuiltinTools.SEARCH_DIR: "search_directory",
     types.BuiltinTools.VIEW_FILE: "view_file",
-    types.BuiltinTools.START_SUBAGENT: "invoke_subagent",
+    types.BuiltinTools.INVOKE_SUBAGENT: "invoke_subagent",
+    types.BuiltinTools.RUN_WORKFLOW: "run_workflow",
     types.BuiltinTools.GENERATE_IMAGE: "generate_image",
     types.BuiltinTools.SEARCH_WEB: "search_web",
     types.BuiltinTools.READ_URL_CONTENT: "read_url_content",
     types.BuiltinTools.FINISH: "finish",
 }
 
-# Reverse map from canonical StepUpdate proto field name to SDK public
-# BuiltinTools value.
+# Reverse map from canonical StepUpdate proto field name to SDK tool name
+# (including harness-internal actions like skill_lookup that are not exposed
+# on the public BuiltinTools enum).
 PROTO_FIELD_TO_SDK_NAME: dict[str, str] = {
-    v: k.value for k, v in BUILTIN_TOOL_PROTO_FIELDS.items()
+    **{v: k.value for k, v in BUILTIN_TOOL_PROTO_FIELDS.items()},
+    "skill_lookup": "skill_lookup",
 }
 
+# Argument keys in tool call JSON payloads that carry wire-format URIs
+# (file:///..., cns://...) and must be normalized to clean filesystem paths.
+WIRE_PATH_ARGUMENT_KEYS: frozenset[str] = frozenset({
+    "path",
+    "file_path",
+    "directory_path",
+    "TargetFile",
+    "output_path",
+    "script_path",
+    "ScriptPath",
+})
 
-class LocalAgentConfig(connection.AgentConfig):
-  """Configuration for the local harness backend.
+normalize_wire_path = connection.normalize_wire_path
+normalize_workspace_path = connection.normalize_workspace_path
+normalize_workspace_paths = connection.normalize_workspace_paths
+make_step_id = connection.make_step_id
 
-  This is the default config for the Agent class. It uses the
-  Go-based localharness binary.
 
-  By default, all tools are enabled but ``run_command`` is denied via
-  ``policy.confirm_run_command()``.  To enable fully autonomous execution
-  (including shell access), pass ``policies=[policy.allow_all()]``.
-
-  When ``workspaces`` are configured, file tools are automatically
-  restricted to those directories via ``policy.workspace_only()``.
-  """
+class BaseLocalAgentConfig(connection.AgentConfig):
+  """Base configuration class for local harness agent configurations."""
 
   model_config = pydantic.ConfigDict(
       arbitrary_types_allowed=True, validate_assignment=True
@@ -81,7 +90,93 @@ class LocalAgentConfig(connection.AgentConfig):
   policies: list[policy.Policy] = pydantic.Field(
       default_factory=policy.confirm_run_command
   )
+  env: dict[str, str] | None = pydantic.Field(
+      default=None,
+      description=(
+          "Optional custom environment variables for the localharness"
+          " subprocess."
+      ),
+  )
   workspaces: list[str] = pydantic.Field(default_factory=lambda: [os.getcwd()])
+
+  @pydantic.field_validator("workspaces", mode="before")
+  @classmethod
+  def _validate_workspaces(cls, v: Any) -> list[str]:
+    return normalize_workspace_paths(v, default_to_cwd=True)
+
+  @pydantic.field_validator("app_data_dir")
+  @classmethod
+  def _validate_app_data_dir(cls, v: str | None) -> str | None:
+    if v is not None and not os.path.isabs(v):
+      raise ValueError(f"app_data_dir must be an absolute path, got '{v}'")
+    return v
+
+  @pydantic.model_validator(mode="after")
+  def _validate_allowed_subagents(self) -> "BaseLocalAgentConfig":
+    declared_names = {
+        sub.name for sub in self.subagents or [] if getattr(sub, "name", None)
+    }
+    valid_names = declared_names
+    if self.capabilities and self.capabilities.allowed_subagents is not None:
+      unknown = set(self.capabilities.allowed_subagents) - valid_names
+      if unknown:
+        raise ValueError(
+            "Unknown subagent name(s) in CapabilitiesConfig.allowed_subagents:"
+            f" {sorted(unknown)}. Valid subagents are: {sorted(valid_names)}"
+        )
+    for sub in self.subagents or []:
+      if sub.capabilities and sub.capabilities.allowed_subagents is not None:
+        unknown = set(sub.capabilities.allowed_subagents) - valid_names
+        if unknown:
+          raise ValueError(
+              "Unknown subagent name(s) in"
+              f" SubagentConfig('{sub.name}').capabilities.allowed_subagents:"
+              f" {sorted(unknown)}. Valid subagents are: {sorted(valid_names)}"
+          )
+    return self
+
+  @pydantic.model_validator(mode="after")
+  def _validate_skills_sources(self) -> "BaseLocalAgentConfig":
+    if self.skills_paths and self.inline_skills:
+      raise ValueError(
+          "combining inline_skills and skills_paths is not supported by"
+          " LocalHarness; provide either inline_skills or skills_paths, not"
+          " both."
+      )
+    return self
+
+  def _get_system_instructions(self) -> types.SystemInstructions | None:
+    """Returns the system instructions, normalizing shorthand if needed."""
+    if isinstance(self.system_instructions, str):
+      return types.TemplatedSystemInstructions(
+          sections=[
+              types.SystemInstructionSection(content=self.system_instructions)
+          ]
+      )
+    return self.system_instructions
+
+  def _get_or_create_save_dir(self) -> str:
+    """Returns save_dir, generating a temporary one if not specified."""
+    save_dir = self.save_dir
+    if save_dir is None:
+      save_dir = tempfile.mkdtemp(prefix="antigravity_")
+      logging.info("No save_dir specified; using %s", save_dir)
+    return save_dir
+
+
+class LocalAgentConfig(BaseLocalAgentConfig):
+  """Configuration for the local harness backend.
+
+  This is the default config for the Agent class. It uses the
+  Go-based localharness binary.
+
+  By default, all tools are enabled but ``run_command`` is denied via
+  ``policy.confirm_run_command()``.  To enable fully autonomous execution
+  (including shell access), pass ``policies=[policy.allow_all()]``.
+
+  When ``workspaces`` are configured, file tools are automatically
+  restricted to those directories by the policy evaluator.
+  """
 
   # Top-level shorthand fields — flow into models.
   model: str | types.ModelTarget | None = None
@@ -91,7 +186,7 @@ class LocalAgentConfig(connection.AgentConfig):
   project: str | None = None
   location: str | None = None
 
-  def __init__(
+  def __init__(  # pylint: disable=super-init-not-called
       self,
       *,
       system_instructions: str | types.SystemInstructions | None = None,
@@ -101,14 +196,21 @@ class LocalAgentConfig(connection.AgentConfig):
       hooks: list[hooks_mod.Hook] | None = None,
       triggers: list[triggers_mod.Trigger] | None = None,
       mcp_servers: list[types.McpServerConfig] | None = None,
+      subagents: list[types.SubagentConfig] | None = None,
       workspaces: list[str] | None = None,
+      env: dict[str, str] | None = None,
       conversation_id: str | None = None,
+      session_continuation_mode: types.SessionContinuationMode | None = None,
       save_dir: str | None = None,
       app_data_dir: str | None = None,
       response_schema: (
           dict[str, Any] | type[pydantic.BaseModel] | str | None
       ) = None,
       skills_paths: list[str] | None = None,
+      inline_skills: list[types.InlineSkill] | None = None,
+      retry_config: types.RetryConfig | None = None,
+      budget_config: types.BudgetConfig | None = None,
+      compaction_config: types.CompactionConfig | None = None,
       model: str | types.ModelTarget | None = None,
       models: list[types.ModelTarget] | None = None,
       api_key: str | None = None,
@@ -117,6 +219,12 @@ class LocalAgentConfig(connection.AgentConfig):
       location: str | None = None,
       **kwargs: Any,
   ):
+    if vertex is None and (
+        os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in ("true", "1")
+        or os.environ.get("GOOGLE_GENAI_USE_ENTERPRISE", "").lower()
+        in ("true", "1")
+    ):
+      vertex = True
 
     init_data = {
         k: v
@@ -126,14 +234,10 @@ class LocalAgentConfig(connection.AgentConfig):
     if "kwargs" in init_data:
       kwargs_dict = init_data.pop("kwargs")
       if isinstance(kwargs_dict, dict):
-        init_data.update(kwargs_dict)
+        init_data.update(
+            {k: v for k, v in kwargs_dict.items() if v is not None}
+        )
     pydantic.BaseModel.__init__(self, **init_data)
-
-  @pydantic.field_validator("app_data_dir")
-  def _validate_app_data_dir(cls, v: str | None) -> str | None:  # pylint: disable=no-self-argument
-    if v is not None and not os.path.isabs(v):
-      raise ValueError(f"app_data_dir must be an absolute path, got '{v}'")
-    return v
 
   def _build_shorthand_endpoint(self) -> types.ModelEndpoint | None:
     """Builds the custom endpoint from connection shorthand fields."""
@@ -141,6 +245,7 @@ class LocalAgentConfig(connection.AgentConfig):
       return types.VertexEndpoint(
           project=self.project,
           location=self.location,
+          api_key=self.api_key,
       )
     return types.GeminiAPIEndpoint(api_key=self.api_key)
 
@@ -212,43 +317,6 @@ class LocalAgentConfig(connection.AgentConfig):
     self.__dict__["models"] = self._merge_models_list()
     return self
 
-  @pydantic.model_validator(mode="after")
-  def _apply_workspace_policies(self) -> "LocalAgentConfig":
-    """Prepends workspace-scoping policies when workspaces are configured.
-
-    Always prepends — even when the user sets explicit policies — so that
-    file operations are always restricted to the configured workspaces.
-    Users who want truly unrestricted access should set ``workspaces=[]``.
-    """
-    if self.workspaces:
-      # Automatically include the app data directory in the workspace allowlist
-      app_data_path = self.app_data_dir or DEFAULT_APP_DATA_DIR
-      resolved_app_data_dir = pathlib.Path(app_data_path).expanduser().resolve()
-      allowed_paths = [*self.workspaces, str(resolved_app_data_dir)]
-
-      self.__dict__["policies"] = (
-          policy.workspace_only(allowed_paths) + self.policies
-      )
-    return self
-
-  def _get_system_instructions(self) -> types.SystemInstructions | None:
-    """Returns the system instructions, normalizing shorthand if needed."""
-    if isinstance(self.system_instructions, str):
-      return types.TemplatedSystemInstructions(
-          sections=[
-              types.SystemInstructionSection(content=self.system_instructions)
-          ]
-      )
-    return self.system_instructions
-
-  def _get_or_create_save_dir(self) -> str:
-    """Returns save_dir, generating a temporary one if not specified."""
-    save_dir = self.save_dir
-    if save_dir is None:
-      save_dir = tempfile.mkdtemp(prefix="antigravity_")
-      logging.info("No save_dir specified; using %s", save_dir)
-    return save_dir
-
   def create_strategy(
       self,
       *,
@@ -265,11 +333,71 @@ class LocalAgentConfig(connection.AgentConfig):
         models=self.models,
         system_instructions=self._get_system_instructions(),
         capabilities_config=self.capabilities,
+        compaction_config=self._get_effective_compaction_config(),
         conversation_id=self.conversation_id,
+        session_continuation_mode=self.session_continuation_mode,
+        save_dir=self._get_or_create_save_dir(),
+        workspaces=self.workspaces,
+        app_data_dir=self.app_data_dir,
+        skills_paths=self.skills_paths,
+        inline_skills=self.inline_skills,
+        mcp_servers=self.mcp_servers,
+        env=self.env,
+        subagents=self.subagents,
+        debug_config=self.debug_config,
+        retry_config=self.retry_config,
+        budget_config=self.budget_config,
+        policies=list(self.policies) if self.policies is not None else None,
+        tools=self.tools,
+    )
+
+
+class InteractionsAgentConfig(LocalAgentConfig):
+  """Configuration for the local harness backend using the GAOS Interactions API.
+
+  Inherits all fields, validators, and model shorthand resolution from
+  ``LocalAgentConfig``, and creates an ``InteractionsConnectionStrategy``
+  that speaks the GAOS Interactions JSON protocol over WebSocket to
+  ``localharness``.
+  """
+
+  @pydantic.model_validator(mode="after")
+  def _validate_triggers(self) -> "InteractionsAgentConfig":
+    """Validates that unsupported triggers are not configured."""
+    if self.triggers:
+      raise types.AntigravityValidationError(
+          "Automated triggers are not yet supported with"
+          " InteractionsAgentConfig."
+      )
+    return self
+
+  def create_strategy(
+      self,
+      *,
+      tool_runner: Any,
+      hook_runner: Any,
+  ) -> "connection.ConnectionStrategy":
+    from google.antigravity.connections.local import interactions_connection  # pylint: disable=g-import-not-at-top
+
+    return interactions_connection.InteractionsConnectionStrategy(
+        tool_runner=tool_runner,
+        hook_runner=hook_runner,
+        models=self.models,
+        system_instructions=self._get_system_instructions(),
+        capabilities_config=self.capabilities,
+        compaction_config=self._get_effective_compaction_config(),
+        conversation_id=self.conversation_id,
+        session_continuation_mode=self.session_continuation_mode,
         save_dir=self._get_or_create_save_dir(),
         workspaces=self.workspaces,
         app_data_dir=self.app_data_dir,
         skills_paths=self.skills_paths,
         mcp_servers=self.mcp_servers,
+        env=self.env,
         subagents=self.subagents,
+        debug_config=self.debug_config,
+        retry_config=self.retry_config,
+        budget_config=self.budget_config,
+        policies=list(self.policies) if self.policies is not None else None,
+        tools=self.tools,
     )

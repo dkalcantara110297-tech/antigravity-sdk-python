@@ -17,21 +17,36 @@
 import asyncio
 import unittest
 
-from opentelemetry import trace
-from opentelemetry.sdk import trace as sdk_trace
-from opentelemetry.sdk.trace import export as sdk_trace_export
-from opentelemetry.sdk.trace.export import in_memory_span_exporter
-from opentelemetry.util import _once as otel_once
-
 from google.antigravity import types
 from google.antigravity.hooks import hooks as hooks_base
-from google.antigravity.utils import otel as otel_hooks
+
+# pylint: disable=g-import-not-at-top
+try:
+  import pytest
+  pytest.importorskip("opentelemetry.sdk")
+except ImportError:
+  pass
+
+try:
+  from opentelemetry import trace
+  from opentelemetry.sdk import trace as sdk_trace
+  from opentelemetry.sdk.trace import export as sdk_trace_export
+  from opentelemetry.sdk.trace.export import in_memory_span_exporter
+  from opentelemetry.util import _once as otel_once
+  from google.antigravity.utils import otel as otel_hooks
+  _OTEL_AVAILABLE = True
+except ImportError:
+  _OTEL_AVAILABLE = False
+# pylint: enable=g-import-not-at-top
 
 
 class DummyStep(types.Step):
   trajectory_id: str = ""
 
 
+@unittest.skipIf(
+    not _OTEL_AVAILABLE, "opentelemetry-sdk optional dependency not installed"
+)
 class OtelHooksTest(unittest.IsolatedAsyncioTestCase):
   """Tests tracing context propagation across turns and interleaved steps."""
 
@@ -106,7 +121,7 @@ class OtelHooksTest(unittest.IsolatedAsyncioTestCase):
     op_ctx_start_sub = hooks_base.OperationContext(turn_ctx)
     tool_call_sub = types.ToolCall(
         id="parent_traj:1",
-        name=types.BuiltinTools.START_SUBAGENT.value,
+        name=types.BuiltinTools.INVOKE_SUBAGENT.value,
         args={"TypeName": "SubAgentCoder"},
     )
     await otel_hooks.OTelPreToolCallHook().run(op_ctx_start_sub, tool_call_sub)
@@ -144,7 +159,7 @@ class OtelHooksTest(unittest.IsolatedAsyncioTestCase):
     op_ctx_start_sub.set_state("trajectory_id", "sub_traj")
     await otel_hooks.OTelPostToolCallHook().run(
         op_ctx_start_sub,
-        types.ToolResult(name=types.BuiltinTools.START_SUBAGENT.value),
+        types.ToolResult(name=types.BuiltinTools.INVOKE_SUBAGENT.value),
     )
 
     await otel_hooks.OTelPostTurnHook().run(turn_ctx, "done")
@@ -338,7 +353,7 @@ class OtelHooksTest(unittest.IsolatedAsyncioTestCase):
         op_ctx_sub,
         types.ToolCall(
             id="traj:2",
-            name=types.BuiltinTools.START_SUBAGENT.value,
+            name=types.BuiltinTools.INVOKE_SUBAGENT.value,
             args={"Role": "AutoCleanupSubAgent"},
         ),
     )
@@ -359,7 +374,7 @@ class OtelHooksTest(unittest.IsolatedAsyncioTestCase):
     # subagent span.
     await otel_hooks.OTelPostToolCallHook().run(
         op_ctx_sub,
-        types.ToolResult(name=types.BuiltinTools.START_SUBAGENT.value),
+        types.ToolResult(name=types.BuiltinTools.INVOKE_SUBAGENT.value),
     )
 
     await otel_hooks.OTelPostTurnHook().run(turn_ctx, "done")

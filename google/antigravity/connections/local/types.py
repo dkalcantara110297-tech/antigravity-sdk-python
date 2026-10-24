@@ -21,7 +21,10 @@ import pydantic
 class RunCommandResult(pydantic.BaseModel):
   """Structured result from a run_command tool execution."""
 
-  output: str = ""
+  output: str = pydantic.Field(
+      default="",
+      validation_alias=pydantic.AliasChoices("output", "combined_output"),
+  )
 
   def __str__(self) -> str:
     return self.output
@@ -30,7 +33,7 @@ class RunCommandResult(pydantic.BaseModel):
 class ListDirectoryEntry(pydantic.BaseModel):
   """Single entry in a directory listing."""
 
-  name: str
+  name: str = ""
   is_directory: bool = False
   file_size: int = 0
 
@@ -38,7 +41,10 @@ class ListDirectoryEntry(pydantic.BaseModel):
 class ListDirectoryResult(pydantic.BaseModel):
   """Structured result from a list_directory tool execution."""
 
-  entries: list[ListDirectoryEntry] = pydantic.Field(default_factory=list)
+  entries: list[ListDirectoryEntry] = pydantic.Field(
+      default_factory=list,
+      validation_alias=pydantic.AliasChoices("entries", "results"),
+  )
 
   def __str__(self) -> str:
     parts = []
@@ -80,11 +86,27 @@ class EditFileResult(pydantic.BaseModel):
 class GenerateImageResult(pydantic.BaseModel):
   """Structured result from a generate_image tool execution."""
 
-  image_name: str = ""
-  aspect_ratio: str = ""
+  image_name: str = pydantic.Field(
+      default="",
+      description="Base requested filename prefix for the image artifact.",
+  )
+  aspect_ratio: str = pydantic.Field(
+      default="",
+      description=(
+          "Requested aspect ratio for the generated image (e.g. '16:9', '1:1')."
+      ),
+  )
+  output_path: str = pydantic.Field(
+      default="",
+      description=(
+          "Platform-native local filesystem path where the generated output"
+          " image artifact was saved on disk. Empty if generation failed or no"
+          " file output was written."
+      ),
+  )
 
   def __str__(self) -> str:
-    return self.image_name
+    return self.output_path or self.image_name
 
 
 class SearchWebResult(pydantic.BaseModel):

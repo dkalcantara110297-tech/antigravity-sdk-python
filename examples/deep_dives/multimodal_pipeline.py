@@ -49,6 +49,7 @@ import sys
 
 from absl import app
 from absl import logging
+
 from google.antigravity import Agent
 from google.antigravity import LocalAgentConfig
 from google.antigravity import types
@@ -84,16 +85,19 @@ def _find_generated_image(name: str) -> str | None:
   Returns:
     The path to the image file if found, else None.
   """
-  base = os.path.expanduser("~/.gemini/antigravity/brain")
-  if not os.path.isdir(base):
-    return None
-  matches = glob.glob(os.path.join(base, "**", f"{name}*"), recursive=True)
-  valid_extensions = {".png", ".jpg", ".jpeg"}
-  image_matches = [
-      m for m in matches if os.path.splitext(m)[1].lower() in valid_extensions
+  search_dirs = [
+      os.path.expanduser("~/.gemini/antigravity/brain"),
   ]
-  if image_matches:
-    return max(image_matches, key=os.path.getmtime)
+  for base in search_dirs:
+    if not base or not os.path.isdir(base):
+      continue
+    matches = glob.glob(os.path.join(base, "**", f"{name}*"), recursive=True)
+    valid_extensions = {".png", ".jpg", ".jpeg"}
+    image_matches = [
+        m for m in matches if os.path.splitext(m)[1].lower() in valid_extensions
+    ]
+    if image_matches:
+      return max(image_matches, key=os.path.getmtime)
   return None
 
 
@@ -112,7 +116,7 @@ async def run() -> None:
           "the image is created, tell the user the image name and "
           "a one-line confirmation. Do not describe the image."
       ),
-      model="gemini-3.5-flash",
+      model="gemini-3.8-flash",
       capabilities=types.CapabilitiesConfig(
           enabled_tools=[types.BuiltinTools.GENERATE_IMAGE]
       ),
@@ -143,9 +147,9 @@ async def run() -> None:
 
   image_path = _find_generated_image("birman_birthday")
   if not image_path:
-    print("ERROR: Could not find generated image on disk.")
-    print("The generate_image tool saves images as <name>_<ts>.png")
-    print("under ~/.gemini/antigravity/brain/<conversation>/")
+    print("WARNING: Could not find generated image on disk.")
+    print("Phase 1 image generation may have been rate limited or disabled.")
+    print("Skipping Phase 2 discriminator execution.")
     return
 
   print(f"  Found image: {image_path}")
